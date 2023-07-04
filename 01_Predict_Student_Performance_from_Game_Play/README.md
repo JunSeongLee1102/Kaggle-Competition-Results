@@ -17,4 +17,20 @@ macro f1: average of f1 scores of the true and false labels. Additionally, each 
 2. But I could use the macro averaged F1 score function to do feature engineering.  
     a. I modified one question's features and see if it affect to the all-question macro f1 score. By including other question models' inference results when calculating the score.  
     b. Iterate a and keep only features that contribute to the f1 score.  
+  
+## Install dependencies
+conda env update --file prediction_environment.yml 
 
+## Download inputs
+Download input files from the following links and put them in the main directory of the 01_Predict_Student_Performance_from_Game_Play  
+Main dataset: https://www.kaggle.com/competitions/predict-student-performance-from-game-play   
+Features (from Vadim Kamaev): https://www.kaggle.com/datasets/vadimkamaev/featur  
+folder structure (make inputs directory and put them in the directory)
+-main/inputs/featur  
+-main/inputs/predict-student-performance-from-game-play
+
+## Order
+1. Set the input directory path: 
+2. Generate dataset by run catboost_cudf_questionwise_train.ipynb (It will display error because the fold is not splited).  
+3. Generate data split by data_split.ipynb  
+4. Train the catboost model by run.
