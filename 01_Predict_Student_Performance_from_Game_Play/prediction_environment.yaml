@@ -180,4 +180,3 @@ dependencies:
       - tqdm==4.65.0
       - triton==2.0.0
       - urllib3==1.26.13
-prefix: /home/junseonglee/miniconda3/envs/rapids-23.06
