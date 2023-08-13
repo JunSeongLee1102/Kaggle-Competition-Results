@@ -122,7 +122,7 @@ class ResNet(nn.Module):
                                bias=False)
         self.bn1 = nn.BatchNorm3d(self.in_planes)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool3d(kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1))
+        self.maxpool = nn.AvgPool3d(kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1))
         self.avgpool = nn.AvgPool3d(kernel_size=(5, 5, 5), stride=(3, 3, 3), padding=(2, 2, 2))
         self.layer1 = self._make_layer(block,
                                        block_inplanes[0],
@@ -201,10 +201,13 @@ class ResNet(nn.Module):
 
         x1 = self.layer1(x)
         x11 = self.avgpool(x1)
+        x11 = self.avgpool(x11)
         x2 = self.layer2(x1)
-        x22 = self.avgpool(x2)        
+        x22 = self.avgpool(x2)     
+        x22 = self.avgpool(x22)           
         x3 = self.layer3(x2)
-        x33 = self.avgpool(x3)        
+        x33 = self.avgpool(x3) 
+        x33 = self.avgpool(x33)               
         x4 = self.layer4(x3)
         x44 = self.avgpool(x4)        
 
