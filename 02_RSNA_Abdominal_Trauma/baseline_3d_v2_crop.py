@@ -4,6 +4,7 @@
 # In[1]:
 
 
+import time
 from tqdm import tqdm
 import sys
 import glob
@@ -25,8 +26,11 @@ from joblib import Parallel, delayed
 import bz2
 import pickle
 import gzip
+import mgzip
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from multiprocessing import Pool
+import lz4.frame
+
 
 import torch
 from torchvision import transforms
@@ -37,6 +41,10 @@ from torch import nn
 import segmentation_models_pytorch as smp
 import timm
 from timm.utils import AverageMeter
+from timm.models import resnet
+
+#sys.path.append('/home/junseonglee/Desktop/01_codes/inputs/rsna-2023-abdominal-trauma-detection')
+import timm_new
 
 from monai.transforms import Resize
 import  monai.transforms as transforms
@@ -49,10 +57,26 @@ wandb.login(key = '585f58f321685308f7933861d9dde7488de0970b')
 #os.environ['CUDA_LAUNCH_BLOCKING']='1'
 
 
-# # Parameters
-
 # In[2]:
 
+
+timm_new.__version__
+
+
+# # Parameters
+
+# In[3]:
+
+
+backbone = 'timm/resnet10t.c3_in1k'
+
+IS_WANDB = True
+PROJECT_NAME = 'RSNA_ABTD'
+GROUP_NAME= 'backbone_test'
+RUN_NAME=   f'{backbone}'
+
+if not IS_WANDB:
+    PROJECT_NAME = 'Dummy_Project'
 
 BASE_PATH  = '/home/junseonglee/Desktop/01_codes/inputs/rsna-2023-abdominal-trauma-detection'
 TRAIN_PATH = f'{BASE_PATH}/train_images'
@@ -65,35 +89,42 @@ if not os.path.isdir(DATA_PATH):
     os.mkdir(DATA_PATH)
 
 RESOL = 128
+UP_RESOL = 128
 N_CHANNELS = 6
-BATCH_SIZE = 16
-ACCUM_STEP = 8
-N_WORKERS  = 8
-LR = 0.0002
+BATCH_SIZE = 24
+ACCUM_STEPS = 1
+N_WORKERS  = 10
+LR = 0.001
 N_EPOCHS = 100
+EARLY_STOP_COUNT = 20
 N_FOLDS  = 5
 N_PREPROCESS_CHUNKS = 12
 train_df = pd.read_csv(f'{BASE_PATH}/train.csv')
 train_df = train_df.sort_values(by=['patient_id'])
 n_blocks = 4
-drop_rate = 0.0
-drop_path_rate = 0.0
+drop_rate = 0.2
+drop_path_rate = 0.2
 p_mixup = 0.0
 
-backbone = 'resnet18d'
+
 #backbone = 'efficientnet_b1'
+
 
 
 wandb_config = {
     'RESOL': RESOL,
-    'BATCH_SIZE': BATCH_SIZE,
+    'BACKBONE': backbone,
+    'N_CHANNELS': N_CHANNELS,
+    'N_EPOCHS': N_EPOCHS,
+    'N_FOLDS': N_FOLDS,
+    'EARLY_STOP_COUNT': EARLY_STOP_COUNT,
+    'BATCH_SIZE': BATCH_SIZE,    
     'LR': LR,
     'N_EPOCHS': N_EPOCHS,
-    
-
+    'DROP_RATE': drop_rate,
+    'DROP_PATH_RATE': drop_path_rate,
+    'MIXUP_RATE': p_mixup
 }
-
-
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 DEVICE
@@ -102,7 +133,7 @@ DEVICE
 
 # # Data split
 
-# In[3]:
+# In[4]:
 
 
 train_df = pd.read_csv(f'{BASE_PATH}/train.csv')
@@ -164,7 +195,7 @@ np.unique(train_df['fold'].to_numpy(), return_counts = True)
 
 # # Dataset
 
-# In[4]:
+# In[5]:
 
 
 def compress(name, data):
@@ -176,16 +207,24 @@ def decompress(name):
         data = pickle.load(f)
     return data
 
-def compress_fast(name, data):
+
+def compress_fast(name, data):  
     np.save(name, data)
 
-
 def decompress_fast(name):
-    data = np.load(f'{name}.npy')    
+    data = np.load(f'{name}.npy')
+    return data
+
+def save_png(name, data):
+    cv2.imwrite(f'{name}.png', data)
+
+
+def load_png(name):
+    data = cv2.imread(f'{name}.png', cv2.IMREAD_UNCHANGED)
     return data
 
 
-# In[5]:
+# In[6]:
 
 
 #The order of the crop region data format
@@ -258,7 +297,7 @@ def crop_resize_avg_and_std_3d(data, region):
     return resized_cropped
 
 
-# In[6]:
+# In[7]:
 
 
 def standardize_pixel_array(dcm: pydicom.dataset.FileDataset) -> np.ndarray:
@@ -271,7 +310,6 @@ def standardize_pixel_array(dcm: pydicom.dataset.FileDataset) -> np.ndarray:
 
     return pixel_array
 
-# Read each slice and stack them to make 3d data
 def process_3d_crop(save_path, mask_path, data_path = TRAIN_PATH):
     tmp = save_path.split('/')[-1][:-4]
     tmp = tmp.split('_')
@@ -280,7 +318,7 @@ def process_3d_crop(save_path, mask_path, data_path = TRAIN_PATH):
     mask = decompress(mask_path)
     crop_regions = calc_crop_region(mask)
     absolute_crop = crop_regions[5].copy() # To load minimum pixels...
- 
+
     crop_regions[5] = 0, 1, 0, 1, 0, 1
 
     imgs = {}    
@@ -343,17 +381,22 @@ def process_3d_crop(save_path, mask_path, data_path = TRAIN_PATH):
         except:
             processed_img_3d[i] = crop_resize_avg_and_std_3d(imgs_3d, np.array([0, 1, 0, 1, 0, 1]))
 
-    processed_img_3d = processed_img_3d.reshape(6*RESOL*RESOL*RESOL)
     #here to
-    #gzip too slow maybe I should divide the inference process to chunks or do not save in the inference notebooks
+    #gzip too slow maybe I should divide the inference process to chunks or do not save in the inference notebooks\
+    
+    
+    processed_img_3d = (processed_img_3d).astype(np.float16)
+    #compress(save_path, processed_img_3d)
     compress_fast(save_path, processed_img_3d)                      
+    #save_pickle(save_path, processed_img_3d)
 
     del imgs, img
     gc.collect()
+    return processed_img_3d
 
 
 
-# In[7]:
+# In[8]:
 
 
 # Preprocess dataset
@@ -364,7 +407,7 @@ def process_3d_wrapper(process_ind, rng_samples = rng_samples, train_meta_df = t
             process_3d(train_meta_df.iloc[i]['path'])
 
 
-# In[8]:
+# In[9]:
 
 
 class AbdominalCTDataset(Dataset):
@@ -385,11 +428,19 @@ class AbdominalCTDataset(Dataset):
 
         #To avoid loading issue when applying multiprocessing to the unzip module
         try:
-            data_3d = decompress_fast(row['cropped_path'])  
-            data_3d = data_3d.reshape(6, RESOL, RESOL, RESOL).astype(np.float32)  # channel, 3D             
+        #data_3d = decompress_fast(row['cropped_path'])  
+            data_3d = decompress_fast(row['cropped_path'])            
+            #data_3d = data_3d.reshape(6, RESOL, RESOL, RESOL).astype(np.float32)  # channel, 3D             
         except:                
-            data_3d = process_3d_crop(row['cropped_path'], row['mask_path'])           
-            data_3d = data_3d.reshape(6, RESOL, RESOL, RESOL).astype(np.float32)  # channel, 3D                 
+            while(1):
+                try:
+                    data_3d = decompress_fast(row['cropped_path'])        
+                    break                        
+                except:
+                    continue
+                
+            #data_3d = process_3d_crop(row['cropped_path'], row['mask_path'])           
+            #data_3d = data_3d.reshape(6, RESOL, RESOL, RESOL).astype(np.float32)  # channel, 3D                 
 
         data_3d = torch.from_numpy(data_3d)
         if self.transform_set is not None:
@@ -414,7 +465,7 @@ del train_dataset, data_3d, label
 gc.collect()
 
 
-# In[9]:
+# In[10]:
 
 
 import timm.models.layers
@@ -422,7 +473,7 @@ import timm.models.layers
 
 # # Model
 
-# In[10]:
+# In[11]:
 
 
 from timm.models.layers.conv2d_same import Conv2dSame
@@ -509,14 +560,14 @@ def convert_3d(module):
 #    print(out[i].shape)
 
 
-# In[11]:
+# In[12]:
 
 
 class TimmSegModel(nn.Module):
     def __init__(self, backbone, segtype='unet', pretrained=False):
         super(TimmSegModel, self).__init__()
 
-        self.encoder = timm.create_model(
+        self.encoder = timm_new.create_model(
             backbone,
             in_chans=N_CHANNELS,
             features_only=True,
@@ -535,78 +586,63 @@ class TimmSegModel(nn.Module):
         #        n_blocks=n_blocks,
         #    )
         self.avgpool = nn.AvgPool2d(5, 4, 2)
+        
         [_.shape[1] for _ in g]
-        self.convs = nn.ModuleList()
+        self.convs1x1 = nn.ModuleList()    
+        self.batchnorms = nn.ModuleList()    
+        self.batchnorms13 = nn.ModuleList()
         for i in range(0, len(g)):
-            self.convs.append(nn.Conv2d(g[i].shape[1], 1, 3, 2, 1))
+            self.convs1x1.append(nn.Conv2d(g[i].shape[1], 13, 1))
+            self.batchnorms.append(nn.BatchNorm2d(g[i].shape[1]))
+            self.batchnorms13.append(nn.BatchNorm2d(13))
+
         del g
         gc.collect()
     def forward(self,x):
         global_features = self.encoder(x)[:n_blocks]        
         for i in range(0, len(global_features)):
-            global_features[i] = self.convs[i](global_features[i])
+            #global_features[i] = self.batchnorms[i](global_features[i])
+            global_features[i] = self.convs1x1[i](global_features[i])
+            #global_features[i] = self.batchnorms13[i](global_features[i])
+            
             #global_features[i] = self.avgpool(global_features[i])
         return global_features
         #seg_features = self.decoder(*global_features)
         #seg_features = self.segmentation_head(seg_features)
 
 
-# In[12]:
+# In[13]:
 
 
 class AbdominalClassifier(nn.Module):
-    def __init__(self, model_depth, device = DEVICE):
+    def __init__(self, device = DEVICE):
         super().__init__()
         self.device = device
-        #self.resnet3d = generate_model(model_depth = model_depth, n_input_channels = 1)
+        self.upsample = torch.nn.Upsample(size = [UP_RESOL, UP_RESOL, UP_RESOL])
         self.resnet3d = TimmSegModel(backbone)
         self.resnet3d = convert_3d(self.resnet3d)
         #self.resnet3d.load_state_dict(torch.load(f'{BASE_PATH}/seg_models_backup/timm3d_res18d_unet4b_128_128_128_dsv2_flip12_shift333p7_gd1p5_bs4_lr3e4_20x50ep_fold0_best.pth'), strict=False)
         self.flatten  = nn.Flatten()
         self.dropout  = nn.Dropout(p=0.5)
-        self.softmax  = nn.Softmax(dim=1)
-        
-        size_res_out  = 0
-        sample_input  = torch.zeros(1, N_CHANNELS, RESOL, RESOL, RESOL)
-        sample_output = self.resnet3d(sample_input)
-        
-        for i in range(0, len(sample_output)):
-            size_channel = sample_output[i].shape[1]
-            size_res_out += self.flatten(sample_output[i]).shape[1]//size_channel
-        del sample_input, sample_output
-        gc.collect()
-        print(f'size_res_out: {size_res_out}')
-        self.fc_bowel = nn.Linear(size_res_out, 2)
-        self.fc_extrav= nn.Linear(size_res_out, 2)
-        self.fc_kidney= nn.Linear(size_res_out, 3)
-        self.fc_liver = nn.Linear(size_res_out, 3)
-        self.fc_spleen= nn.Linear(size_res_out, 3)
-        
+        self.softmax  = nn.Softmax(dim=1)        
         self.maxpool  = nn.MaxPool1d(5, 1)
-
     def forward(self, x):
+        batch_size = x.shape[0]
+        x = self.upsample(x)
         x = self.resnet3d(x)
         pooled_features = []
         for i in range(0, len(x)):        
-            pooled_features.append(self.flatten(torch.sum(x[i], dim = 1)))
-
-        for i in range(0, 4):
-            x[i] = self.flatten(pooled_features[i])
-        x = torch.cat(x, axis = 1)
-        #x     = self.dropout(x)
-        bowel = self.fc_bowel(x)
-        extrav= self.fc_extrav(x)
-        kidney= self.fc_kidney(x)
-        liver = self.fc_liver(x)
-        spleen= self.fc_spleen(x)
-
-        labels = torch.cat([bowel, extrav, kidney, liver, spleen], dim = 1)
-
-        bowel_soft = self.softmax(bowel)
-        extrav_soft = self.softmax(extrav)
-        kidney_soft = self.softmax(kidney)
-        liver_soft = self.softmax(liver)
-        spleen_soft = self.softmax(spleen)
+            #pooled_features.append(self.flatten(torch.sum(x[i], dim = 1)))
+            pooled_features.append(torch.reshape(torch.mean(x[i], dim = (2, 3, 4)), (batch_size, 13, 1)))
+            
+        x = torch.cat(pooled_features, dim=2)
+        labels = torch.mean(x, dim=2)
+        
+        bowel_soft = self.softmax(labels[:,0:2])
+        extrav_soft = self.softmax(labels[:,2:4])
+        kidney_soft = self.softmax(labels[:,4:7])
+        liver_soft = self.softmax(labels[:,7:10])
+        spleen_soft = self.softmax(labels[:,10:13])
 
         any_in = torch.cat([1-bowel_soft[:,0:1], 1-extrav_soft[:,0:1], 
                             1-kidney_soft[:,0:1], 1-liver_soft[:,0:1], 1-spleen_soft[:,0:1]], dim = 1) 
@@ -617,10 +653,10 @@ class AbdominalClassifier(nn.Module):
         return labels, any_in
 
 
-# In[13]:
+# In[14]:
 
 
-model = AbdominalClassifier(10)
+model = AbdominalClassifier()
 
 def get_n_params(model):
     pp=0
@@ -638,10 +674,10 @@ gc.collect()
 
 # # Train
 
-# In[14]:
+# In[15]:
 
 
-model = AbdominalClassifier(18)
+model = AbdominalClassifier()
 model.to(DEVICE)
 
 
@@ -663,7 +699,7 @@ crit_liver  = nn.CrossEntropyLoss(weight = torch.from_numpy(weights).to(DEVICE))
 crit_spleen = nn.CrossEntropyLoss(weight = torch.from_numpy(weights).to(DEVICE))
 
 
-# In[15]:
+# In[16]:
 
 
 def normalize_to_one(tensor):
@@ -683,7 +719,7 @@ def apply_softmax_to_labels(X_out):
 
     return X_out
 
-def calculate_score(X_outs, ys):
+def calculate_score(X_outs, ys, step = 'train'):
     X_outs = X_outs.astype(np.float64)
     ys     = ys.astype(np.float64)
 
@@ -694,28 +730,37 @@ def calculate_score(X_outs, ys):
     spleen_weights = ys[:,10] + 2*ys[:,11] + 4*ys[:,12]
     any_in_weights = ys[:,13] + 6*ys[:,14]
     
-    loss = (
-             sklearn.metrics.log_loss(ys[:,:2], X_outs[:,:2], sample_weight = bowel_weights)
-           + sklearn.metrics.log_loss(ys[:,2:4], X_outs[:,2:4], sample_weight = extrav_weights)
-           + sklearn.metrics.log_loss(ys[:,4:7], X_outs[:,4:7], sample_weight = kidney_weights)
-           + sklearn.metrics.log_loss(ys[:,7:10], X_outs[:,7:10], sample_weight = liver_weights)
-           + sklearn.metrics.log_loss(ys[:,10:13], X_outs[:,10:13], sample_weight = spleen_weights)
-           + sklearn.metrics.log_loss(ys[:,13:15], X_outs[:,13:15], sample_weight =  any_in_weights)
-           ) / 6
-    return loss
 
-def calculate_loss(X_outs, X_any, y):
-    loss  = crit_bowel(X_out[:,:2], y[:,:2])
-    loss += crit_extrav(X_out[:,2:4], y[:,2:4])
-    loss += crit_kidney(X_out[:,4:7], y[:,4:7])
-    loss += crit_liver(X_out[:,7:10], y[:,7:10])
-    loss += crit_spleen(X_out[:,10:13], y[:,10:13])
-    loss += crit_any(X_any,  torch.cat([torch.ones(batch_size, 1).to(DEVICE)- y[:,13:14],y[:,13:14]], dim = 1))  
-    loss /= 6
-    return loss
+    bowel_loss  = sklearn.metrics.log_loss(ys[:,:2], X_outs[:,:2], sample_weight = bowel_weights)
+    extrav_loss = sklearn.metrics.log_loss(ys[:,2:4], X_outs[:,2:4], sample_weight = extrav_weights)
+    kidney_loss = sklearn.metrics.log_loss(ys[:,4:7], X_outs[:,4:7], sample_weight = kidney_weights)
+    liver_loss  = sklearn.metrics.log_loss(ys[:,7:10], X_outs[:,7:10], sample_weight = liver_weights)
+    spleen_loss = sklearn.metrics.log_loss(ys[:,10:13], X_outs[:,10:13], sample_weight = spleen_weights)
+    any_in_loss = sklearn.metrics.log_loss(ys[:,13:15], X_outs[:,13:15], sample_weight =  any_in_weights)
+    
+    avg_loss = (bowel_loss + extrav_loss + kidney_loss + liver_loss + spleen_loss + any_in_loss)/6
+
+    losses= {f'{step}_bowel_metric': bowel_loss, f'{step}_extrav_metric': extrav_loss, f'{step}_kidney_metric': kidney_loss,
+             f'{step}_liver_metric': liver_loss, f'{step}_spleen_metric': spleen_loss, f'{step}_any_in_metric': any_in_loss,
+             f'{step}_avg_metric': avg_loss}
+
+    wandb.log(losses)
+    return avg_loss
+
+def calculate_loss(X_out, X_any, y):
+    batch_size = X_out.shape[0]
+    bowel_loss  = crit_bowel(X_out[:,:2], y[:,:2])
+    extrav_loss = crit_extrav(X_out[:,2:4], y[:,2:4])
+    kidney_loss = crit_kidney(X_out[:,4:7], y[:,4:7])
+    liver_loss  = crit_liver(X_out[:,7:10], y[:,7:10])
+    spleen_loss = crit_spleen(X_out[:,10:13], y[:,10:13])
+    any_in_loss = crit_any(X_any,  torch.cat([torch.ones(batch_size, 1).to(DEVICE)- y[:,13:14],y[:,13:14]], dim = 1))
+    
+    avg_loss = (bowel_loss + extrav_loss + kidney_loss + liver_loss + spleen_loss + any_in_loss)/6
+    return bowel_loss, extrav_loss, kidney_loss, liver_loss, spleen_loss, any_in_loss, avg_loss
 
 
-# In[16]:
+# In[17]:
 
 
 def mixup(inputs, truth, clip=[0, 1]):
@@ -732,14 +777,24 @@ transforms_train = transforms.Compose([
     transforms.RandFlipd(keys=["image"], prob=0.5, spatial_axis=2),
     transforms.RandAffined(keys=["image"], translate_range=[int(x*y) for x, y in zip([RESOL, RESOL, RESOL], [0.3, 0.3, 0.3])], padding_mode='zeros', prob=0.7),
     transforms.RandGridDistortiond(keys=("image"), prob=0.5, distort_limit=(-0.01, 0.01), mode="nearest"),    
+    #monai.transforms.RandGibbsNoise(prob=0.1, alpha=(0.0, 1.0)),
 ])
 
 transforms_valid = transforms.Compose([
 ])
 
 
-# In[17]:
+# In[18]:
 
+
+wandb.init(
+    config = wandb_config,
+    project= PROJECT_NAME,
+    group  = GROUP_NAME,
+    name   = RUN_NAME,
+    dir    = BASE_PATH)
+
+backbone = backbone.replace('/', '_')
 
 if __name__ == '__main__':
     train_dataset = AbdominalCTDataset(train_meta_df[train_meta_df['fold']!=0], is_train = True, transform_set  = transforms_train)
@@ -751,35 +806,51 @@ if __name__ == '__main__':
                             num_workers = N_WORKERS, drop_last = False)
 
     valid_loader = DataLoader(dataset = valid_dataset, shuffle = False, batch_size = BATCH_SIZE, pin_memory = False, 
-                            num_workers = N_WORKERS, drop_last = False)     
+                            num_workers = N_WORKERS//2, drop_last = False)     
     
     ttl_iters = N_EPOCHS * len(train_loader)
+    
+    #gradient accumulation for stability of the training
+    accum_len = int(np.ceil(len(train_loader)/ACCUM_STEPS)+0.001)
+    accum_points = np.zeros(accum_len, int)
+    accum_scale  = np.zeros(accum_len, int)
+    
+    prev_step = -1
+    for i in range(0, accum_len):
+        accum_points[i] = min(prev_step+ACCUM_STEPS, len(train_loader)-1)
+        accum_scale[i]  = accum_points[i] - prev_step
+        prev_step = accum_points[i]
+    
+    print(accum_points)
+    print(accum_scale)
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr = LR)
-    n_batch_iters = int(np.ceil(len(train_loader)/ACCUM_STEP)+0.01)
+    n_batch_iters = len(train_loader)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LR, 
                                                     steps_per_epoch= n_batch_iters, epochs = N_EPOCHS)
-    last_count_start = (n_batch_iters-1)*ACCUM_STEP
-    last_count_step  = n_batch_iters - last_count_start
 
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     gc.collect()
 
     val_metrics = np.ones(N_EPOCHS)*100
 
-    for epoch in range(0, N_EPOCHS):     
+    for epoch in tqdm(range(0, N_EPOCHS), leave = False):     
 
         train_meters = {'loss': AverageMeter()}
         val_meters   = {'loss': AverageMeter()}
         
         model.train()
-        pbar = tqdm(train_loader, leave=False)  
+        #pbar = tqdm(train_loader, leave=False)  
 
         X_outs=[]
         ys=[]
+        accum_counter = 0
         counter = 0
         last_count_on = False
-        for X, y in pbar:
-            counter+=1
+        for X, y in train_loader:
+            current_lr = float(scheduler.get_last_lr()[0])
+            wandb.log({'lr': current_lr})
+            
             batch_size = X.shape[0]
             X, y = X.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad()
@@ -790,30 +861,35 @@ if __name__ == '__main__':
                     do_mixup = True
                     X, y, labels_shuffled, lam = mixup(X, y)                
                 
-                loss = calculate_loss(X_out, X_any, y)
+                bowel_loss, extrav_loss, kidney_loss, liver_loss, spleen_loss, any_in_loss, avg_loss = calculate_loss(X_out, X_any, y)
                 if do_mixup:
-                    loss2 = calculate_loss(X_out, X_any, labels_shuffled)
-                    loss = loss * lam  + loss2 * (1 - lam)                
-
-                #Gradient accumulation
-                #https://www.kaggle.com/competitions/understanding_cloud_organization/discussion/105614
-                if not last_count_on:    
-                    scaler.scale(loss / ACCUM_STEP).backward()
-                    if((counter % ACCUM_STEP) ==0):
-                        scaler.step(optimizer)
-                        scheduler.step()
-                        scaler.update()          
-                    if(counter ==last_count_start):
-                        last_count_on = True
-                
-                else:
-                    scaler.scale(loss / last_count_step).backward()
-                    if(counter == n_batch_iters-1):
-                        scaler.step(optimizer)
-                        scheduler.step()
-                        scaler.update()       
+                    bowel_loss2, extrav_loss2, kidney_loss2, liver_loss2, spleen_loss2, any_in_loss2, avg_loss2 = calculate_loss(X_out, X_any, labels_shuffled)
+                    bowel_loss  = bowel_loss * lam  + bowel_loss2 * (1 - lam)
+                    extrav_loss = extrav_loss * lam  + extrav_loss2 * (1 - lam)
+                    kidney_loss = kidney_loss * lam  + kidney_loss2 * (1 - lam)         
+                    liver_loss  = liver_loss * lam  + liver_loss2 * (1 - lam) 
+                    spleen_loss = spleen_loss * lam  + spleen_loss2 * (1 - lam) 
+                    any_in_loss = any_in_loss * lam  + any_in_loss2 * (1 - lam) 
+                    avg_loss = avg_loss * lam  + avg_loss2 * (1 - lam)       
                     
-
+                step = 'train'
+                wandb.log({f'{step}_bowel_loss': bowel_loss.item(),
+                           f'{step}_extrav_loss': extrav_loss.item(),
+                           f'{step}_kidney_loss': kidney_loss.item(),
+                           f'{step}_liver_loss': liver_loss.item(),
+                           f'{step}_spleen_loss': spleen_loss.item(),
+                           f'{step}_any_loss': any_in_loss.item(),
+                           f'{step}_avg_loss': avg_loss.item()
+                           })
+                
+                scaler.scale(avg_loss/accum_scale[accum_counter]).backward()
+                if(counter==accum_points[accum_counter]):
+                    scaler.step(optimizer)
+                    scheduler.step()
+                    scaler.update()    
+                    accum_counter+=1
+                
+            counter+=1                   
 
             #Metric calculation
             y_any = torch.cat([torch.ones(batch_size, 1).to(DEVICE)- y[:,13:14],y[:,13:14]], dim = 1)    
@@ -827,16 +903,16 @@ if __name__ == '__main__':
             y     = np.hstack([y, y_any])
             ys.append(y)
 
-            trn_loss = loss.item()      
+            trn_loss = avg_loss.item()      
             train_meters['loss'].update(trn_loss, n=X.size(0))     
-            pbar.set_description(f'Train loss: {trn_loss}')   
+            #pbar.set_description(f'Train loss: {trn_loss}')   
             
             
         print('Epoch {:d} / trn/loss={:.4f}'.format(epoch+1, train_meters['loss'].avg))    
 
         X_outs = np.vstack(X_outs) 
         ys     = np.vstack(ys)
-        metric = calculate_score(X_outs, ys)                 
+        metric = calculate_score(X_outs, ys, 'train')                 
         print('Epoch {:d} / train/metric={:.4f}'.format(epoch+1, metric))   
 
         del X, X_outs, y, ys, X_any
@@ -846,7 +922,7 @@ if __name__ == '__main__':
         X_outs=[]
         ys=[]
         model.eval()
-        for X, y in tqdm(valid_loader, leave=False):        
+        for X, y in valid_loader:        
             batch_size = X.shape[0]        
             X, y = X.to(DEVICE), y.to(DEVICE)
                  
@@ -868,8 +944,12 @@ if __name__ == '__main__':
 
         X_outs = np.vstack(X_outs) 
         ys     = np.vstack(ys)
-        metric = calculate_score(X_outs, ys)                
-        print('Epoch {:d} / val/metric={:.4f}'.format(epoch+1, metric))   
+        metric = calculate_score(X_outs, ys, 'valid')                
+        print('Epoch {:d} / val/metric={:.4f}'.format(epoch+1, metric))           
+        
+        del X, X_outs, y, ys, X_any
+        gc.collect()        
+        torch.cuda.empty_cache()
         
         #Save the best model    
         if(metric < np.min(val_metrics)):
@@ -879,12 +959,30 @@ if __name__ == '__main__':
                 a = 1
             best_metric = metric
             print(f'Best val_metric {best_metric} at epoch {epoch+1}!')
-            torch.save(model, f'{BASE_PATH}/weights/best.pt')    
-        val_metrics[epoch] = metric
+            torch.save(model, f'{BASE_PATH}/weights/{backbone}_lr{LR}_epochs_{N_EPOCHS}_resol{UP_RESOL}_batch{BATCH_SIZE}.pt')    
+            not_improve_counter=0
+            val_metrics[epoch] = metric
+            continue            
         
-        del X, X_outs, y, ys, X_any
-        gc.collect()        
-        torch.cuda.empty_cache()
+        val_metrics[epoch] = metric                        
+        not_improve_counter+=1
+        if(not_improve_counter == EARLY_STOP_COUNT):
+            print(f'Not improved for {not_improve_counter} epochs, terminate the train')
+            break
+wandb.log({'best_total_log_loss': best_metric})
+wandb.finish()
+
+
+# In[ ]:
+
+
+import wandb
+try:
+    wandb.log({'best_total_log_loss': best_metric})
+    wandb.finish()
+    
+except:
+    print('Wandb is already finished!')
 
 
 # In[ ]:
