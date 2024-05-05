@@ -1,0 +1,7 @@
+input/
+catboost_info/
+**csv
+wandb/
+main/__pycache__/
+.vscode/
+lib/
